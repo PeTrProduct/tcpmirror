@@ -22,13 +22,10 @@ new server responds the same as existing server for same requests.
 ```
 tcpmirror -l <listen_addr> -p <primary_addr> -m <mirror_addrs1[,mirror_addrs2]> [-d]
 ```
-**-l** Listen on `host:port` for incoming traffic
-
-**-p** Relay traffic to primary `host:port` (two-way)
-
-**-m** Mirror traffic to `host:port[,host:port]...` (one-way)
-
-**-d** Print debug information to stdout
+- **-l**	Listen on `host:port` for incoming traffic
+- **-p**	Relay traffic to primary `host:port` (two-way)
+- **-m**	Mirror traffic to `host:port[,host:port]...` (one-way)
+- **-d**	Print debug information to stdout
 
 ## Install
 
@@ -59,7 +56,7 @@ go run tcpmirror.go -l localhost:8080 -p localhost:9090 -m localhost:9091
 git clone https://github.com/PeTrProduct/tcpmirror.git
 cd tcpmirror; 
 go build ./tcpmirror.go
-tcpmirror -l -l localhost:8080 -p localhost:9090 -m localhost:9091
+tcpmirror -l localhost:8080 -p localhost:9090 -m localhost:9091
 ```
 
 ## Run as a systemd service
