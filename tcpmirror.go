@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+//	"log/syslog"
 )
 
 const (
@@ -45,7 +46,7 @@ func main() {
 
 	for {
 		in, _ := l.Accept()
-		fmt.Printf("Incoming connection from %s\n", in)
+		//fmt.Printf("Incoming connection from %s\n", in)
 
 		p, err := net.Dial("tcp", *primaryPtr)
 		if err != nil {
