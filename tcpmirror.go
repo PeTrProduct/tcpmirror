@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Version = "1.0.7"
+const Version = "1.0.8"
 
 var (
 	listenPtr  = flag.String("l", "localhost:8080", "Listen on `host:port` for incoming traffic")
@@ -113,7 +113,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 		}
 	}()
 
-	// Горутина: Primary -> Клиент
+	// Горутина: Primary -> Client
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(in, primary)
@@ -154,9 +154,6 @@ func (aw *asyncWriter) worker() {
 	// Цикл range автоматически вычитает ВСЕ оставшиеся пакеты из буфера
 	// после того, как канал будет закрыт (close(queue)), гарантируя отсутствие потери данных.
 	for buf := range aw.queue {
-		if buf == nil {
-			continue // Пропускаем проверочные маркеры из Fast-Path
-		}
 		_, err := aw.conn.Write(buf)
 		if err != nil {
 			if *debugPtr {
@@ -193,19 +190,17 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 		return len(p), nil // Молча дропаем данные, если зеркало закрыто или вышло из строя
 	}
 
-	// ОПТИМИЗАЦИЯ FAST-PATH: Проверяем, есть ли вообще место в очереди БЕЗ аллокации памяти.
-	// Если канал полон, сразу уходим в default и дропаем пакет, не нагружая Garbage Collector.
-	select {
-	case aw.queue <- nil: // Пробуем закинуть пустой маркер для проверки емкости
-		<-aw.queue // Место есть! Мгновенно забираем проверочный nil обратно
-	default:
+	// ПОТОКОБЕЗОПАСНЫЙ FAST-PATH: Проверяем заполненность канала на лету.
+	// len() и cap() для каналов в Go возвращают атомарные значения O(1).
+	// Если канал полон, мы сразу выходим без единой аллокации памяти (make/copy), защищая GC от нагрузки.
+	if len(aw.queue) >= cap(aw.queue) {
 		if *debugPtr {
 			log.Printf("Mirror %s queue full, dropping packet (fast-path)", aw.conn.RemoteAddr())
 		}
 		return len(p), nil
 	}
 
-	// Выделяем память только тогда, когда точно уверены, что пакет поместится
+	// Выделяем память только тогда, когда уверены, что в очереди было место
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
@@ -213,7 +208,8 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 	case aw.queue <- buf:
 		// Пакет успешно добавлен в буфер отправки зеркала
 	default:
-		// Крайне редкий случай: если за наносекунду между проверкой и записью место заняла другая горутина
+		// Исключительно редкий случай: если за наносекунду между проверкой len() и отправкой 
+		// место успели занять параллельные горутины других клиентов.
 		if *debugPtr {
 			log.Printf("Mirror %s queue full, dropping packet (race-path)", aw.conn.RemoteAddr())
 		}
