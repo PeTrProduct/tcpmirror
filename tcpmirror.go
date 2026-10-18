@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Version = "1.0.2"
+const Version = "1.0.3"
 
 var (
 	listenPtr  = flag.String("l", "localhost:8080", "Listen on `host:port` for incoming traffic")
@@ -64,10 +64,10 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 	var mirrors []net.Conn
 	var mirrorWriters []*asyncWriter
 
-	// Корректное закрытие всех ресурсов
+	// Гарантированная очистка всех ресурсов при выходе
 	defer func() {
 		for _, aw := range mirrorWriters {
-			aw.Close() // Закрывает канал и ждет завершения воркера
+			aw.Close() // Закрывает канал и завершает воркер
 		}
 		for _, m := range mirrors {
 			_ = m.Close()
@@ -127,15 +127,17 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 }
 
 type asyncWriter struct {
-	conn net.Conn
-	queue chan []byte
-	wg    sync.WaitGroup
+	conn   net.Conn
+	queue  chan []byte
+	closed chan struct{}
+	wg     sync.WaitGroup
 }
 
 func newAsyncWriter(conn net.Conn) *asyncWriter {
 	aw := &asyncWriter{
-		conn:  conn,
-		queue: make(chan []byte, 100),
+		conn:   conn,
+		queue:  make(chan []byte, 100),
+		closed: make(chan struct{}),
 	}
 	aw.wg.Add(1)
 	go aw.worker()
@@ -150,7 +152,7 @@ func (aw *asyncWriter) worker() {
 			if *debugPtr {
 				log.Printf("Mirror %s write error: %v. Dropping remaining traffic.", aw.conn.RemoteAddr(), err)
 			}
-			// Опустошаем канал в случае ошибки сокета, чтобы предотвратить блокировку основного потока
+			// Опустошаем канал до тех пор, пока он не закроется, чтобы не блокировать Write
 			for range aw.queue {}
 			return
 		}
@@ -162,13 +164,29 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 		return 0, nil
 	}
 
-	// Выделяем память и копируем данные ДО отправки в канал.
-	// Это гарантирует изолированность данных от io.Copy.
+	// Защита от записи в закрытый канал: если Close() уже был вызван, игнорируем запись
+	select {
+	case <-aw.closed:
+		return len(p), nil
+	default:
+	}
+
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
+	// Перехват возможной паники, если канал закроется прямо во время отправки (редкий Race Condition)
+	defer func() {
+		if rec := recover(); rec != nil {
+			if *debugPtr {
+				log.Printf("Mirror %s recovery from panic (channel closed during write)", aw.conn.RemoteAddr())
+			}
+		}
+	}()
+
 	select {
 	case aw.queue <- buf:
+	case <-aw.closed:
+		// Если канал закрылся, пока мы ждали место в очереди
 	default:
 		if *debugPtr {
 			log.Printf("Mirror %s queue full, dropping packet", aw.conn.RemoteAddr())
@@ -179,8 +197,11 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 }
 
 func (aw *asyncWriter) Close() {
+	// Сигнализируем методу Write, что мы закрываемся, через закрытие сигнального канала done (closed)
+	close(aw.closed)
+	// Теперь безопасно закрываем саму очередь данных
 	close(aw.queue)
-	aw.wg.Wait() // Ждем, пока воркер штатно завершит работу
+	aw.wg.Wait() 
 }
 
 func Usage() {
