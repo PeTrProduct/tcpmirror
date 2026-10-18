@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Version = "1.0.4"
+const Version = "1.0.5"
 
 var (
 	listenPtr  = flag.String("l", "localhost:8080", "Listen on `host:port` for incoming traffic")
@@ -31,7 +31,7 @@ func main() {
 	log.Printf("[*] Primary backend: %s\n", *primaryPtr)
 	log.Printf("[*] Mirror backends: %v\n", mirrorAddrs)
 
-	// Используем tcp4, чтобы избежать конфликтов разрешения localhost/IPv6 адресов
+	// Используем явный net.Listen("tcp4"), чтобы избежать конфликтов IPv4/IPv6 при разрешении localhost
 	l, err := net.Listen("tcp4", *listenPtr)
 	if err != nil {
 		log.Fatalf("Critical: Error listening on %s: %v", *listenPtr, err)
@@ -44,6 +44,7 @@ func main() {
 			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
+		// Обрабатываем каждое клиентское соединение в изолированной горутине
 		go handleConnection(in, *primaryPtr, mirrorAddrs)
 	}
 }
@@ -65,10 +66,10 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 	var mirrors []net.Conn
 	var mirrorWriters []*asyncWriter
 
-	// Гарантированное корректное закрытие всех ресурсов сессии
+	// Гарантированная и безопасная очистка ресурсов сессии при выходе
 	defer func() {
 		for _, aw := range mirrorWriters {
-			aw.Close() // Закрывает канал и ждет завершения воркера
+			aw.Close() // Сигнализирует воркеру о закрытии и дожидается его завершения
 		}
 		for _, m := range mirrors {
 			_ = m.Close()
@@ -89,7 +90,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 	}
 
 	var allWriters []io.Writer
-	allWriters = append(allWriters, primary)
+	allWriters = append(allWriters, primary) // Первым пишем в primary
 
 	for _, m := range mirrors {
 		aw := newAsyncWriter(m)
@@ -97,12 +98,13 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 		allWriters = append(allWriters, aw)
 	}
 
+	// Мультиплексируем поток данных: сначала идет запись в primary, затем в очереди зеркал
 	mw := io.MultiWriter(allWriters...)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Клиент -> (Primary + Зеркала)
+	// Горутина: Клиент -> (Primary + Зеркала)
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(mw, in)
@@ -111,7 +113,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 		}
 	}()
 
-	// Primary -> Клиент
+	// Горутина: Primary -> Клиент
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(in, primary)
@@ -127,18 +129,19 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 	}
 }
 
+// asyncWriter изолирует медленные зеркала, предотвращая задержки на основном сервере
 type asyncWriter struct {
 	conn      net.Conn
 	queue     chan []byte
-	closed    chan struct{} // Сигнальный канал для неблокирующей проверки статуса
+	closed    chan struct{} // Сигнальный маркер для неблокирующей проверки статуса
 	wg        sync.WaitGroup
-	closeOnce sync.Once // Гарантирует, что закрытие каналов произойдет ровно 1 раз
+	closeOnce sync.Once // Гарантирует, что сигнал закрытия выполнится строго 1 раз
 }
 
 func newAsyncWriter(conn net.Conn) *asyncWriter {
 	aw := &asyncWriter{
 		conn:   conn,
-		queue:  make(chan []byte, 100),
+		queue:  make(chan []byte, 100), // Буфер на 100 пакетов
 		closed: make(chan struct{}),
 	}
 	aw.wg.Add(1)
@@ -148,16 +151,26 @@ func newAsyncWriter(conn net.Conn) *asyncWriter {
 
 func (aw *asyncWriter) worker() {
 	defer aw.wg.Done()
-	
-	for buf := range aw.queue {
-		_, err := aw.conn.Write(buf)
-		if err != nil {
-			if *debugPtr {
-				log.Printf("Mirror %s write error: %v. Stopping worker.", aw.conn.RemoteAddr(), err)
-			}
-			// Если сокет зеркала отвалился, воркер сам инициирует закрытие очереди.
-			aw.stop() 
+
+	for {
+		select {
+		case <-aw.closed:
+			// Основной поток вызвал Close(), завершаем работу горутины
 			return
+		case buf, ok := <-aw.queue:
+			if !ok {
+				return
+			}
+			_, err := aw.conn.Write(buf)
+			if err != nil {
+				if *debugPtr {
+					log.Printf("Mirror %s write error: %v. Stopping worker.", aw.conn.RemoteAddr(), err)
+				}
+				// При ошибке записи в зеркало переводим структуру в статус закрытой.
+				// Канал aw.queue намеренно ОСТАЕТСЯ открытым, чтобы уберечь метод Write от паники.
+				aw.stop()
+				return
+			}
 		}
 	}
 }
@@ -167,45 +180,50 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 		return 0, nil
 	}
 
-	// Быстрая проверка: если писатель уже переведен в закрытое состояние, дропаем пакет
+	// 1. Быстрая проверка: если писатель закрыт, мгновенно дропаем пакет
 	select {
 	case <-aw.closed:
 		return len(p), nil
 	default:
 	}
 
-	// Выделяем память и копируем данные ДО отправки в канал
+	// Клонируем слайс байт до отправки в очередь во избежание Race Condition со стороны io.Copy
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
-	// Неблокирующая отправка с защитой от Race Condition
+	// 2. Защищенная каскадная проверка через select
 	select {
 	case <-aw.closed:
-		// Если канал закрылся за время копирования буфера
 		return len(p), nil
-	case aw.queue <- buf:
-		// Успешно добавлено в очередь
 	default:
-		// Очередь полна. Дропаем пакет, защищая стабильность primary
-		if *debugPtr {
-			log.Printf("Mirror %s queue full, dropping packet", aw.conn.RemoteAddr())
+		// Так как канал queue никогда не закрывается во время работы Write,
+		// паника 'send on closed channel' физически невозможна из-за специфики выбора кейсов в select
+		select {
+		case <-aw.closed:
+			return len(p), nil
+		case aw.queue <- buf:
+			// Пакет успешно добавлен в буфер отправки зеркала
+		default:
+			// Буфер переполнен или воркер остановлен. Дропаем пакет ради стабильности primary
+			if *debugPtr {
+				log.Printf("Mirror %s queue full or stopped, dropping packet", aw.conn.RemoteAddr())
+			}
 		}
 	}
 
+	// Всегда возвращаем успех для MultiWriter, чтобы проблемы зеркал не влияли на сессию с primary
 	return len(p), nil
 }
 
-// Внутренний метод для безопасного перевода структуры в закрытое состояние
 func (aw *asyncWriter) stop() {
 	aw.closeOnce.Do(func() {
-		close(aw.closed) // Сначала переводим флаг closed, чтобы Write больше не трогал очередь
-		close(aw.queue)  // Теперь безопасно закрываем саму очередь данных
+		close(aw.closed) // Закрываем только сигнальный канал
 	})
 }
 
 func (aw *asyncWriter) Close() {
 	aw.stop()
-	aw.wg.Wait() // Ждем штатного завершения фоновой горутины
+	aw.wg.Wait() // Ожидаем штатного выхода фонового воркера
 }
 
 func Usage() {
