@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Version = "1.1.0"
+const Version = "1.1.1"
 
 var (
 	listenPtr  = flag.String("l", "localhost:8080", "Listen on `host:port` for incoming traffic")
@@ -49,7 +49,7 @@ func main() {
 	}
 }
 
-func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs string) {
+func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 	defer in.Close()
 
 	if *debugPtr {
@@ -68,16 +68,13 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs string) {
 
 	// Гарантированная и безопасная очистка ресурсов сессии при выходе
 	defer func() {
-		// Закрываем только писателей — они сами монопольно закроют сокеты внутри себя
+		// Сначала закрываем всех писателей (они внутри себя закроют связанные сокеты)
 		for _, aw := range mirrorWriters {
 			aw.Close() 
 		}
-		// Если сокет зеркала был открыт, но писатель для него не создался (ошибка далее по коду),
-		// закрываем то, что осталось бесхозным.
-		for _, m := range mirrors {
-			if len(mirrorWriters) == 0 { // Защита от дублирования
-				_ = m.Close()
-			}
+		// Закрываем только те сокеты, для которых писатели НЕ успели создаться из-за сбоя
+		for i := len(mirrorWriters); i < len(mirrors); i++ {
+			_ = mirrors[i].Close()
 		}
 	}()
 
