@@ -1,0 +1,18 @@
+[Unit]
+Description=tcpmirror
+After=network.target
+
+[Service]
+User=tcpmirror
+Group=tcpmirror
+WorkingDirectory=/opt/tcpmirror
+ExecStart=/opt/tcpmirror/tcpmirror -l 0.0.0.0:9535 -p localhost:8535 -m localhost:5535
+Restart=always
+
+Environment="GOCACHE=/tmp/gocache"
+
+StandardOutput=file:/var/log/tcpmirror.log
+StandardError=file:/var/log/tcpmirror.error.log
+
+[Install]
+WantedBy=multi-user.target
