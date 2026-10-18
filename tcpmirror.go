@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Version = "1.0.6"
+const Version = "1.0.7"
 
 var (
 	listenPtr  = flag.String("l", "localhost:8080", "Listen on `host:port` for incoming traffic")
@@ -104,7 +104,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Горутина: ... -> Клиент -> (Primary + Зеркала)
+	// Горутина: Клиент -> (Primary + Зеркала)
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(mw, in)
@@ -113,7 +113,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 		}
 	}()
 
-	// Горутина: Primary -> Клиент -> ...
+	// Горутина: Primary -> Клиент
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(in, primary)
@@ -133,7 +133,7 @@ func handleConnection(in net.Conn, primaryAddr string, mirrorAddrs []string) {
 type asyncWriter struct {
 	conn     net.Conn
 	queue    chan []byte
-	mu       sync.RWMutex // Защищает флаг закрытия от состояния гонки с io.Copy
+	mu       sync.RWMutex // Защищает флаг закрытия от состояния гонки с методом Write
 	isClosed bool
 	wg       sync.WaitGroup
 }
@@ -154,6 +154,9 @@ func (aw *asyncWriter) worker() {
 	// Цикл range автоматически вычитает ВСЕ оставшиеся пакеты из буфера
 	// после того, как канал будет закрыт (close(queue)), гарантируя отсутствие потери данных.
 	for buf := range aw.queue {
+		if buf == nil {
+			continue // Пропускаем проверочные маркеры из Fast-Path
+		}
 		_, err := aw.conn.Write(buf)
 		if err != nil {
 			if *debugPtr {
@@ -190,7 +193,19 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 		return len(p), nil // Молча дропаем данные, если зеркало закрыто или вышло из строя
 	}
 
-	// Клонируем слайс байт до отправки в очередь во избежание Race Condition со стороны io.Copy
+	// ОПТИМИЗАЦИЯ FAST-PATH: Проверяем, есть ли вообще место в очереди БЕЗ аллокации памяти.
+	// Если канал полон, сразу уходим в default и дропаем пакет, не нагружая Garbage Collector.
+	select {
+	case aw.queue <- nil: // Пробуем закинуть пустой маркер для проверки емкости
+		<-aw.queue // Место есть! Мгновенно забираем проверочный nil обратно
+	default:
+		if *debugPtr {
+			log.Printf("Mirror %s queue full, dropping packet (fast-path)", aw.conn.RemoteAddr())
+		}
+		return len(p), nil
+	}
+
+	// Выделяем память только тогда, когда точно уверены, что пакет поместится
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
@@ -198,9 +213,9 @@ func (aw *asyncWriter) Write(p []byte) (n int, err error) {
 	case aw.queue <- buf:
 		// Пакет успешно добавлен в буфер отправки зеркала
 	default:
-		// Буфер переполнен. Дропаем пакет ради стабильности primary
+		// Крайне редкий случай: если за наносекунду между проверкой и записью место заняла другая горутина
 		if *debugPtr {
-			log.Printf("Mirror %s queue full, dropping packet", aw.conn.RemoteAddr())
+			log.Printf("Mirror %s queue full, dropping packet (race-path)", aw.conn.RemoteAddr())
 		}
 	}
 
